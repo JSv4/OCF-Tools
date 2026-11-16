@@ -20,7 +20,7 @@ So support is decided per package, at run time, field by field. A package with n
 A MODULE describes one transaction type. Every part is optional.
 
     names         which nodes the transaction points at, and through which of its fields
-    lifecycle     the move it makes on a security's chart, if any
+    lifecycle     one word for what it does to a security: issue, stays, removes or after removal
     checks        the checks to run on it; each is written, or declared as a gap
     writes        the fields it changes; each one says HOW, or says "not yet"
     stands for    another type whose module to use (for deprecated names)
@@ -45,7 +45,7 @@ MODULE stock class authorized shares adjustment                complete, and tin
 MODULE warrant exercise                                        complete
     names         the warrant, through security_id
                   each resulting security, through resulting_security_ids
-    lifecycle     outstanding → removed
+    lifecycle     removes
     checks        issuance-exists, resulting-security-named, resulting-stock-exists,
                   resulting-stock-dated, resulting-stock-stakeholder
     writes        the warrant's lifecycle                      SET to removed
@@ -103,7 +103,7 @@ Every module is somewhere on these four rungs. The rung is worked out from the m
 | Rung | The module has | What the validator can then do for that type |
 |---|---|---|
 | 1. Recognized | `names`, and `writes` all "not yet" | Mark what it touched as unsupported. Nothing is silently skipped |
-| 2. Lifecycle | a `lifecycle` move | Catch it happening to a security that isn't there or was already removed |
+| 2. Lifecycle | a `lifecycle` word, which adds its arrow to the family's chart | Catch it happening to a security that isn't there or was already removed |
 | 3. Checked | written `checks` | Report its own errors |
 | 4. Applied | every write says HOW | Keep the fields it touches trustworthy, so checks elsewhere stay live |
 

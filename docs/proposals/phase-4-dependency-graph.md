@@ -18,6 +18,7 @@ Proposed as the Phase 4 tracker on the roadmap (#145), superseding #164. Adopts 
 - Open decision 2 is narrowed and three are added.
 - A section on what this design keeps open for validating a live event stream later. Streaming itself is out of scope.
 - "Today" now counts what is validated and what isn't, and "Sequencing" splits the phase into three cuts as a result.
+- A section on lifecycle charts: real XState machines, one per family, built from the descriptors and grown in stages.
 
 ## Summary
 
@@ -109,6 +110,53 @@ Every transaction reads some nodes and writes some. From the reference fields on
 5. **Aggregate checks run at end of day over the net.** A same-day transfer momentarily over-issues the class if its resulting issuance is processed before the source removal. Authorized-shares and pool checks instead run against the end-of-day state the machine already builds for snapshots. Same-day order then matters only for lifecycle dependencies, and the resulting-security edges give that order explicitly, replacing the transaction-type ranking used today. Transactions on the same day with no edge between them are ordered by id, so the result never depends on the order of the input. A cycle among the edges is a root error of its own.
 6. **A failing check covered by a ratification is cured.** Its writes are applied, nothing is tainted, and downstream checks run as if it had passed. The finding stays in the output, marked cured, with the id of the ratifying transaction.
 
+### Lifecycle charts
+
+The lifecycle of a security is the one part of this design that is a state machine by nature: one thing, a few states, and rules about which moves are allowed. It is built as a real XState machine, one per family (stock, convertible, warrant, equity compensation).
+
+**The chart.** States are not issued, outstanding and removed. Events are OCF transaction types.
+
+```
+   not issued ── issuance ──▶ outstanding ── a removal ──▶ removed
+                                 │   ▲
+                                 └───┘
+                        things that leave it outstanding
+```
+
+| Family | Leaves it outstanding | Removes it |
+|---|---|---|
+| Stock | Acceptance | Retraction, cancellation, repurchase, transfer, conversion, reissuance, consolidation |
+| Convertible | Acceptance | Retraction, cancellation, transfer, conversion |
+| Warrant | Acceptance | Retraction, cancellation, transfer, exercise |
+| Equity compensation | Acceptance, repricing, vesting, exercise, release | Retraction, cancellation, transfer |
+
+Two rows show why the charts are per family. A warrant exercise removes the warrant. An equity compensation exercise carries a `quantity` and has no `balance_security_id`, so the grant stays outstanding under the same `security_id`. And a return to pool is allowed only on an equity compensation security that is already removed.
+
+**How it is built.** Each descriptor declares one word for its transaction: issue, stays, removes, or after removal. A factory collects those words by family and builds the machine. Adding a transaction type adds an arrow, and nobody edits a chart by hand. Today's `effect` already says most of this (`append` is issue, `none` is stays, `remove` is removes); only the 17 passthrough types need a word assigned.
+
+**How it is used.** As a lookup, not as a running actor. The security's node stores the state value. For each transaction the reducer rebuilds the state from that value, asks whether the event is allowed, and if so stores the state that follows. The node's fields are passed in as the chart's context, so a guard on an arrow can read them. A transaction the chart doesn't allow is a finding, and the node's last-writer pointer supplies the reason: "removed by this exercise on this date".
+
+**What it replaces.** `no-earlier-removal`, `no-other-transactions`, the `removals` index, the machine's hand-run removal check for passthrough types, and its hard-coded exemption for return to pool.
+
+**Stages.** The chart grows without changing how the reducer calls it.
+
+| Stage | Adds | Catches | When |
+|---|---|---|---|
+| 1 | The three states | What today's two checks catch, plus consolidation and plan-security removals | Cut 1 |
+| 2 | A tag on outstanding, "on the cap table" | Nothing new. The snapshot asks the chart which securities to show, with no state names hard-coded | Cut 1 |
+| 3 | An acceptance region inside outstanding | A second acceptance, if that is decided to be an error (open decision 7) | After that decision |
+| 4 | A condition on the exercise and release arrows: something is left | Exercising more than remains | Cut 2, once quantity is written |
+| 5 | A vesting region inside outstanding | Vesting events before a vesting start, and the like | With #165 |
+
+**Checked on the pinned XState (5.18.2).** Rebuilding a state from a stored value and context, asking whether an event is allowed, computing the next state, regions that run side by side, conditions that read the context, and tags all work there.
+
+**Two XState behaviours the charts must be written around.** Both were observed on 5.18.2.
+
+- An arrow with no target and no action counts as "not allowed". So an arrow that leaves the security where it is still has to name its target.
+- An arrow from a state back to itself resets that state's regions. Once outstanding has regions (stage 3), a "stays" transaction therefore has to sit inside the one region it affects, or accepting a grant and then exercising it would silently undo the acceptance.
+
+**Reading it without the code.** A chart's definition is plain data, so it can be rendered as a diagram. The rules for a security can then be reviewed by someone who doesn't read TypeScript, from the same definition that enforces them.
+
 ### Ratification
 
 The board, the stockholders or both can ratify an act that was not validly authorized when it happened. There are legal limits on what can be ratified, and they vary by jurisdiction and by the kind of defect.
@@ -145,9 +193,9 @@ The board, the stockholders or both can ratify an act that was not validly autho
 - **Writes** go on the descriptor table, which already classifies each transaction's `effect` (`append`, `remove`, `none`, `passthrough`) and its collection. It grows to name the aggregates each transaction moves, and whether each write sets a value or adjusts one (rule 4).
 - **State**: the context's four flat issuance arrays and the `removals` index become one node map keyed by id, as #197 proposed, with class, plan and issuer entries alongside securities. `remove` stops filtering the security out and sets its lifecycle instead. The map is immutable: a write produces a new map that shares everything it didn't change, so keeping one per day for snapshots is cheap.
 - **Indexes built at `START`**: the ratification index, keyed by ratified transaction id. The `removals` index goes away, since "was this security removed earlier" becomes a lifecycle question.
-- **Lifecycle**: the per-security state chart from #197, as a static machine definition used as a lookup. The node stores only the state value. "Is this transaction legal in this state" is the lifecycle check, and "what state follows" is the write. No actor is spawned per security. #197's argument against spawned actors stands: a transfer is one atomic write across several nodes, and separate actors would turn that into message ordering. On the pinned `5.18.2` this is `machine.resolveState`, `snapshot.can` and `getNextSnapshot`, all of which work there.
+- **Lifecycle**: a new `lifecycle.ts` holding the chart factory and one function the reducer calls, which answers "is this allowed" and "what state follows". See "Lifecycle charts" above. No actor is spawned per security. #197's argument against spawned actors stands: a transfer is one atomic write across several nodes, and with separate actors one side can apply while the other silently ignores it. Each descriptor gains its lifecycle word.
 - **The outer machine** becomes a day cycle: order the day's transactions, apply them, run the end-of-day aggregate checks, take the snapshot. The `isValidTx` guard exists only to choose between `capTable` and `validationError`. Once nothing halts it goes away, and each validator runs once per transaction instead of twice (today the guard runs it, then `recordOutcome` runs it again).
-- **Tests**: every path through the lifecycle chart is a valid single-security history, and every state and transaction pair the chart doesn't allow is an expected finding. Both can be generated from the chart (XState's path utilities are not exported at `5.18.2`, so this means a newer XState, `@xstate/graph`, or walking the definition directly), alongside hand-written packages for the cross-node cases (transfer, consolidation, split, ratification). Two tests guard the model itself. One records what each check actually reads and fails if it reads something it didn't declare, since an undeclared read is a check that won't be blocked when it should be. The other shuffles a package's transactions and expects identical findings and snapshots.
+- **Tests**: every path through the lifecycle chart is a valid single-security history, and every state and transaction pair the chart doesn't allow is an expected finding. Both can be generated from the chart (XState's path utilities are not exported at `5.18.2`; current XState, `5.33.4`, exports them as `xstate/graph`, so this needs the dependency raised, which is open decision 8), alongside hand-written packages for the cross-node cases (transfer, consolidation, split, ratification). Two tests guard the model itself. One records what each check actually reads and fails if it reads something it didn't declare, since an undeclared read is a check that won't be blocked when it should be. The other shuffles a package's transactions and expects identical findings and snapshots.
 
 ## Holes this closes that exist today
 
@@ -194,24 +242,33 @@ What changes later, and is not decided here:
 4. **Does a blocked check carry one root or all of them?** A class's `outstanding` can be tainted by three bad issuances. Carrying only the first is simpler and matches "fix a root, expose the next". Carrying the set makes the count in `result` honest. Leaning the set.
 5. **How does the validator receive ratifications before OCF has an object for them?** A sidecar input, or a custom transaction type. A custom type collides with the #186 rule above, which would flag it as unknown and taint what it names, so that rule would need an exemption.
 6. **How is an end-of-day aggregate failure tied to transactions?** The check fails on a class and a date, but a ratification names issuances. One rule: the failure is cured if the ratified issuances in that class on or before that date cover the excess. Needs a real over-issuance package to test against.
+7. **Which lifecycle rules beyond removal are errors?** Stage 3 of the charts can catch a second acceptance of the same security. Whether that is an error, a warning or nothing is a judgement about OCF data, not a technical one. The same question will come up for each region added later.
+8. **Raise the XState dependency?** It is pinned at `~5.18.2`. Everything the charts need works there. Generating test histories from a chart needs `xstate/graph`, which later versions export. Leaning yes, as its own small change before the charts land.
 
 ## Sequencing
 
 The engine is about half the work. The other half is validator work the model assumes and the code doesn't have. So the phase splits into three cuts, each useful on its own.
 
-**Cut 1: securities only.** The node map, removed securities kept, no halting, the blocked outcome, taint, declared reads, the lifecycle chart, dependency order within a day, the reference data pre-pass, and the streaming constraints. It runs on the checks that exist today.
+**Cut 1: securities only.** The node map, removed securities kept, no halting, the blocked outcome, taint, declared reads, the lifecycle charts at stages 1 and 2, dependency order within a day, the reference data pre-pass, and the streaming constraints. It runs on the checks that exist today.
 
 What it delivers:
 
 - One run reports every root error in a package, not only the first.
 - Each consequence is marked blocked and points at its root.
 - Snapshots for every day to the end of the package, with untrusted entries marked.
-- Lifecycle rules from one chart, covering consolidation and plan-security removals.
+- Lifecycle rules from one chart per family, covering consolidation and plan-security removals.
 - Unknown transaction types no longer stop the run.
 
 This cut may not need to wait on the stock family moving to findings (#159). It works on the 20 graded types as they are, and a failed legacy stock validator could be wrapped as one error finding that taints its security. That wrapping is untested.
 
-**Cut 2: aggregates.** Class, plan and issuer state, behaviour for the passthrough types that write it, the authorized-shares and pool checks at end of day, rule 4, and the quantity arithmetic for splits and partial exercises. This is the largest cut, and most of it is new validator behaviour, not graph machinery. It needs #159 done, since stock is the family with class aggregates.
+The lifecycle charts land inside cut 1 in four steps, each its own pull request:
+
+1. Add the lifecycle word to each descriptor. Data only; no behaviour changes.
+2. Add `lifecycle.ts` with the factory and the lookup function, tested on short real histories.
+3. Run the charts in shadow. In the test suite, compare each chart's verdict with what `no-earlier-removal` and `no-other-transactions` report on every existing test package, and explain every difference.
+4. Make the lifecycle check the source of truth, and delete the two checks and the `removals` index.
+
+**Cut 2: aggregates.** Class, plan and issuer state, behaviour for the passthrough types that write it, the authorized-shares and pool checks at end of day, rule 4, the quantity arithmetic for splits and partial exercises, and stage 4 of the lifecycle charts. This is the largest cut, and most of it is new validator behaviour, not graph machinery. It needs #159 done, since stock is the family with class aggregates.
 
 **Cut 3: ratification.** Small in code. It needs cut 2, because the ratifiable checks are the aggregate ones, and it needs open decision 5 answered.
 

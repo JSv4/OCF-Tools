@@ -99,7 +99,7 @@ The reducer uses these declarations. A check never looks at taint itself.
 
 ### The lifecycle of a security
 
-One chart per family. They differ only in which transactions the family has.
+This part is a real XState machine. There is one chart per family, and the charts differ only in which transactions the family has.
 
 ```
     not issued ── issuance ─────────────────────────────────▶ outstanding
@@ -117,6 +117,93 @@ One chart per family. They differ only in which transactions the family has.
 ```
 
 "Is this transaction allowed in this state?" is a check like any other. "Which state comes next?" is one of the transaction's writes.
+
+#### Building a chart
+
+Nobody draws a chart by hand. Each transaction type declares one word, and the chart is assembled from those words.
+
+```
+Every transaction type says one of:
+    issue            it creates the security
+    stays            it happens to an outstanding security and leaves it outstanding
+    removes          it happens to an outstanding security and ends it
+    after removal    it happens to a security that is already removed
+
+BUILD CHART (family)
+    collect the family's transaction types, grouped by their word
+    not issued     allows each "issue" type,           and moves to outstanding
+    outstanding    allows each "stays" type,           and stays outstanding
+                   allows each "removes" type,         and moves to removed
+    removed        allows each "after removal" type,   and stays removed
+    → the chart
+```
+
+#### Using a chart
+
+```
+MOVE (chart, the security's stored state, the security's fields, transaction)
+    rebuild the chart's state from the stored state and the fields
+    if the chart does not allow this transaction from here
+        → NOT ALLOWED
+    otherwise
+        → ALLOWED, and the state that follows
+```
+
+The reducer calls MOVE once per transaction that names a security. The graph stores only the state the chart hands back.
+
+In real code, on the pinned XState, the factory and MOVE are about fifteen lines:
+
+```ts
+const arrows = (types: readonly TxKey[], target: string) =>
+  Object.fromEntries(types.map((type) => [type, { target }]));
+
+const chartFor = (family: FamilyWords) =>
+  createMachine({
+    id: family.name,
+    initial: "notIssued",
+    states: {
+      notIssued:   { on: arrows(family.issue, "outstanding") },
+      outstanding: {
+        tags: ["onCapTable"],
+        on: { ...arrows(family.stays, "outstanding"), ...arrows(family.removes, "removed") },
+      },
+      removed:     { on: arrows(family.afterRemoval, "removed") },
+    },
+  });
+
+const move = (chart, value, context, event) => {
+  const at = chart.resolveState({ value, context });
+  if (!at.can(event)) return { allowed: false };
+  return { allowed: true, value: getNextSnapshot(chart, at, event).value };
+};
+```
+
+A prototype of this was run against XState 5.18.2 with a warrant history and two option histories, and gave the expected verdicts, including "not allowed" for a cancellation after an exercise, a return to pool before a cancellation, and a second issuance of the same `security_id`.
+
+#### Growing a chart
+
+The reducer keeps calling MOVE the same way at every stage.
+
+```
+stage 1    the three states above
+stage 2    outstanding carries the tag "on the cap table"; PICTURE asks for that tag
+stage 3    outstanding gains an acceptance region:    pending → accepted
+stage 4    the exercise and release arrows gain a condition:  something is left
+stage 5    outstanding gains a vesting region:        not started → started
+```
+
+Stages 3 to 5 were also tried on 5.18.2: regions side by side, a condition that reads the security's quantity from the context, and the tag surviving each move.
+
+Two things XState does that the charts have to be written around:
+
+```
+An arrow with no target and no action is treated as NOT ALLOWED.
+    So a "stays" arrow must name where it goes, even though that is where it already is.
+
+An arrow from a state back to itself resets the regions inside that state.
+    So once outstanding has regions, a "stays" arrow must live inside the one region it affects.
+    Otherwise accepting a grant and then exercising it would quietly undo the acceptance.
+```
 
 ## The reducer
 
@@ -283,7 +370,8 @@ The 20 graded validator files (`tx_warrant_exercise.ts` and the like) barely cha
 ## What we need to add
 
 - **`ocf_validator/graph.ts`**: the node and field types, and LOOK UP, SET, ADJUST and TAINT.
-- **`ocf_validator/lifecycle.ts`**: one chart per family, used as a lookup. On the pinned XState this is `resolveState`, `can` and `getNextSnapshot`.
+- **`ocf_validator/lifecycle.ts`**: BUILD CHART and MOVE. On the pinned XState this is `createMachine`, `resolveState`, `can` and `getNextSnapshot`.
+- **A lifecycle word on every transaction type**: issue, stays, removes or after removal. Today's `effect` supplies it for 28 types; the 17 passthrough types need one assigned.
 - **`ocf_validator/reducer.ts`**: STEP, ORDER OF, END OF DAY, PICTURE and SUMMARY.
 - **A reference data pre-pass**, and the checks that say what makes a stakeholder, vesting terms object or legend invalid. Those definitions don't exist yet.
 - **Reads and writes for all 45 transaction types.** For the 17 passthrough types this is the first time anything is said about them. In cut 1 they need only their effect on a security's lifecycle.
@@ -317,7 +405,11 @@ Each step is one pull request that leaves the suite green.
 1. Add `graph.ts` with its tests. Nothing uses it yet.
 2. Add the outcome field to `Finding`. Every existing finding is "failed". No behaviour changes.
 3. Fill the graph alongside the four arrays, and move the shared checks over to LOOK UP. Then delete the arrays.
-4. Add the lifecycle charts. Replace `no-earlier-removal` and `no-other-transactions` with the lifecycle check, and delete the removals index.
+4. Add the lifecycle charts, in four pull requests of their own:
+   1. Add the lifecycle word to each transaction type. Data only.
+   2. Add `lifecycle.ts`, tested on short real histories.
+   3. Run the charts in shadow: in the test suite, compare each chart's verdict with `no-earlier-removal` and `no-other-transactions` on every existing test package, and explain every difference.
+   4. Make the lifecycle check the source of truth. Delete the two checks and the removals index.
 5. Add `reads`, STEP, taint and the blocked outcome, and stop halting. These go together: blocked only appears once the run continues past a failure.
 6. Replace the type ranking with ORDER OF.
 7. Add the reference data pre-pass.
