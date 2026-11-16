@@ -95,6 +95,8 @@ CHECK issuance-exists
 
 The reducer uses these declarations. A check never looks at taint itself.
 
+`phase-4-transaction-modules.md` turns these declarations into one module per transaction type, and adds a way for a module to say "this transaction changes that field, but I can't apply it yet".
+
 ### The lifecycle of a security
 
 One chart per family. They differ only in which transactions the family has.
